@@ -1,241 +1,116 @@
 ---
-name: mise-task-runner
-description: Comprehensive guide to mise development environment tool for task running, tool/version management, and environment configuration. Use when setting up mise.toml, creating file tasks, managing tool versions across projects, or troubleshooting the mise task runner.
+name: mise
+description: mise task runner - defines and executes project automation tasks with dependency resolution, argument parsing, file-change caching, and environment inheritance via mise.toml [tasks] sections or executable scripts in .mise/tasks/.
 license: MIT
-compatibility: Requires mise CLI installed (curl https://mise.run | sh). Linux, macOS, Windows supported.
+compatibility: Requires mise CLI (curl https://mise.run | sh). Linux, macOS, Windows.
 metadata:
   version: "1.0"
-  author: elecnix
+author: elecnix
 ---
 
-# mise Development Environment Tool
+# mise
 
-mise is a unified tool and task runner that replaces asdf, direnv, and make. It manages dev tools (node, python, go, etc.), project environment variables, and task automation in one `mise.toml` config.
+mise is a dev-environment manager: tool version pinning (`[tools]`), environment variables (`[env]`), and a task runner (`[tasks]` / `.mise/tasks/`). This skill covers the task runner; tool/env management is outside scope.
 
-## Installation
+## Task Sources
 
-```bash
-curl https://mise.run | sh
-eval "$(~/.local/bin/mise activate bash)"  # Add to ~/.bashrc
-```
+Tasks are defined in two ways, both discovered by walking from cwd up to the config root and merging in order (parent configs first, nearest wins):
 
-## Three Pillars
+- **TOML tasks**: `[tasks.<name>]` tables inside any `mise.toml` / `.mise.toml` / `.mise.local.toml`.
+- **File tasks**: executable scripts under `.mise/tasks/`, `mise-tasks/`, or a configured includes dir. The filename (sans extension) is the task name; nested dirs become colon-separated namespaces (`db/migrate/up` → `db:migrate:up`). File tasks support full editor tooling (syntax highlighting, linting) and are preferred over TOML for non-trivial logic.
 
-### 1. Tool Version Management
-Install and activate specific tool versions per-project:
+Tasks from all sources merge into one namespace. Name collisions: file tasks override TOML tasks of the same name.
 
-```bash
-mise use node@20           # Installs node 20, adds to mise.toml
-mise use -g node@lts       # Global default (adds to ~/.config/mise/config.toml)
-mise install               # Installs all tools in config
-mise ls                    # Lists installed versions
-mise ls-remote python      # Lists available versions for a tool
-```
+## Running Tasks
 
-**mise.toml `[tools]` section:**
-```toml
-[tools]
-node = "20"          # Exact version
-python = "latest"    # Latest available
-go = "lts"           # Latest LTS
-rust = "nightly"     # Nightly channel
-# Version specifiers: 20, lts, latest, nightly, prefix:1.2, path:/custom
-```
+`mise run <task>` executes a task after resolving its dependency DAG (dependencies run first, in parallel when independent). `mise run a b` runs sequentially; `mise run 'a ::: b'` runs in parallel. `mise run '<glob>'` expands namespaces (`test:*`, `db:**`). `mise r` is the short alias. `mise tasks` lists all non-hidden tasks; `mise tasks --hidden` includes tasks prefixed with `_` (convention for internal helpers). `mise tasks edit <name>` opens the task file in `$EDITOR`, creating it if missing. `mise watch <task>` re-runs on `sources` file changes.
 
-### 2. Environment Variables
-Load project-specific environment variables automatically on directory change:
+## Dependency Resolution
 
-```bash
-mise set KEY=value      # Sets config value, updates mise.toml
-mise env                # Outputs shell env commands (run: eval "$(mise env)")
-mise shell              # Spawns subshell with env changes
-```
+Three dependency edges, all accept arrays of task names:
 
-**mise.toml `[env]` section:**
-```toml
-[env]
-_.file = ".env"        # Loads .env file into environment
-DATABASE_URL = "postgresql://localhost/myapp"
-# _.command = "op read ..."  # Load from command output
-# _.template = "..."         # Template expansion
-```
+- `depends`: runs before the task; added to the execution list so they appear in the DAG and run once even if shared.
+- `depends_post`: runs after the task succeeds; also added to the execution list.
+- `wait_for`: if the named task is already in the current run's execution list, wait for it; otherwise skip. Does NOT add the task to the list (unlike `depends`). Used for soft ordering against optional concurrent work.
 
-### 3. Task Runner
-Define and run project automation with parallel dependency resolution:
+Circular dependencies error at resolution time. Dependencies inherit the parent task's environment unless the dependency declares its own `env`.
 
-```bash
-mise run build           # Executes [tasks.build] or .mise/tasks/build
-mise run test -- -v      # Passes args after -- to task
-mise tasks               # Lists all available tasks with descriptions
-mise watch build         # Runs on file changes (requires sources defined)
-mise tasks edit build    # Opens $EDITOR on task file (creates if missing)
-```
+## Task Properties
 
-## Task Types
+| Property | Type | Behavior |
+|----------|------|----------|
+| `run` | string \| [string] | Command(s) to execute. Array runs sequentially; a multi-line string is one shell invocation. Required. |
+| `run_windows` | string | Overrides `run` on Windows. |
+| `description` | string | Shown in `mise tasks`. The only context an agent sees when listing tasks — state what it does, what it requires, what it produces, and when to run it. |
+| `alias` | string | Additional name to invoke the task by. |
+| `dir` | string | Working directory for `run`. Defaults to config root (the directory holding the `mise.toml`). Template-expanded. |
+| `depends` / `depends_post` / `wait_for` | [string] | See Dependency Resolution. |
+| `env` | {K=V} | Environment variables scoped to this task only. NOT propagated to dependencies. |
+| `tools` | {tool=version} | Tool versions activated for this task's execution only. |
+| `sources` | [glob] | Input file globs for cache invalidation and `mise watch`. Relative to config root. |
+| `outputs` | [glob] | Output artifacts. If all outputs are newer than all sources, the task is skipped (cached). |
+| `hide` | bool | Excludes from `mise tasks` default listing. |
+| `quiet` | bool | Suppresses mise's `[task] $ cmd` echo line. |
+| `silent` | bool | Suppresses all task output (stdout+stderr). |
+| `raw` | bool | Connects task stdin/stdout/stderr directly to the parent, disabling parallel execution for this task. Required for prompts (`read`) and interactive tools. |
+| `raw_args` | bool | Passes all CLI args through without usage-spec parsing. |
+| `interactive` | bool | Takes an exclusive I/O lock; blocks other interactive tasks. |
+| `confirm` | string \| {msg} | Prompts for confirmation before running. |
+| `shell` | string | Shell used to run `run` (default `sh -c`). e.g. `pwsh -c`. |
+| `usage` | spec | Inline usage-spec declaration for TOML tasks (file tasks use `#USAGE` comments; see Arguments). |
 
-### TOML Tasks
-```toml
-[tasks.build]
-run = "npm run build"
-description = "Build the frontend"
-alias = "b"              # Run as: mise run b
-depends = ["lint", "test"]  # Runs before build (parallel when possible)
-dir = "{{cwd}}"          # Overrides default (config root directory)
-quiet = true             # Don't print "[build] $ npm run build"
-```
+## File Task Headers
 
-### File Tasks (Recommended)
-Executable scripts in `.mise/tasks/`, `mise-tasks/`, or `.mise/tasks/`. Better editor support (syntax highlighting, linting).
+File tasks declare metadata via leading `#MISE key=value` comments (parsed, not shell):
 
-```bash
-# File: .mise/tasks/test
-#!/usr/bin/env bash
-#MISE description="Run unit tests"
-#MISE sources=["tests/**/*.rs", "src/**/*.rs"]  # For mise watch
-#MISE outputs=["target/debug/test-results"]     # For caching
-set -euo pipefait
+`#MISE description="…"` · `#MISE alias="…"` · `#MISE depends=["…"]` · `#MISE depends_post=["…"]` · `#MISE wait_for=["…"]` · `#MISE sources=["glob"]` · `#MISE outputs=["glob"]` · `#MISE dir="…"` · `#MISE env={K=V}` · `#MISE hide=true` · `#MISE quiet=true` · `#MISE silent=true` · `#MISE raw=true` · `#MISE shell="…"` · `#MISE tools={…}` · `#MISE confirm="…"`
 
-cargo test
-```
+Values are TOML literals (quoted strings, arrays, objects).
 
-**File task header options:**
-`#MISE description="..."` - Shows in `mise tasks`
-`#MISE alias="..."` - Short name
-`#MISE sources=["..."]` - Input files (for `mise watch` and caching)
-`#MISE outputs=["..."]` - Output files
-`#MISE depends=["..."]` - Dependencies
-`#MISE dir="{{cwd}}"` - Working directory override
-`#MISE quiet=true` - Hide command echo
-`#MISE raw=true` - Direct stdin/stdout/stdin (blocks parallel execution)
+## Arguments (Usage Spec)
 
-## Task Arguments (Usage Spec)
+Both file tasks (`#USAGE` comments) and TOML tasks (`usage` key, or `raw_args=false`) parse CLI args via the usage spec. The parser exposes values as `usage_<name>` env vars (hyphens → underscores) inside the task.
 
-File tasks support argument parsing via usage comments:
+- `#USAGE arg "<name>" [type=…] [default=…] [choices=[…]] [help="…"]` — positional. `required` unless `default` set.
+- `#USAGE flag "--long [-short] [value]" [default=…] [help="…"]` — boolean flag, or value-taking flag when a placeholder is given.
+- `#USAGE arg "<name>" required` — mark required.
+- `type=` supports `string` (default), `int`, `float`, `bool`, `path`, `file`, `dir`.
+- `choices=[…]` constrains to an enum.
+- Access: `${usage_<name>}`; flags default to `false` when absent (use `${usage_verbose:-false}`).
+- `mise run task -- <args>` passes everything after `--` verbatim when `raw_args` is set.
 
-```bash
-#!/usr/bin/env bash
-#USAGE arg "<file>" help="File to process" choices=["main.rs", "lib.rs"]
-#USAGE flag "--verbose" help="Enable verbose output"
-#USAGE flag "-o --output <file>" help="Output file" default="out.txt"
+## Environment Inheritance
 
-echo "Processing ${usage_file}"
-[ "${usage_verbose:-false}" = "true" ] && echo "Verbose!"
-```
+Every task inherits the active `[env]` block (including `_.file`-loaded `.env` contents and `_.command` output) plus mise's computed environment. `_.file = { path = ".env", redact = true }` redacts values from `mise env` output to avoid leaking secrets. Task-local `env` merges on top of inherited env. `env` is NOT forwarded to dependency tasks — each dependency re-derives from `[env]`.
 
-Run with: `mise run process main.rs --verbose`
+## Runtime Variables
 
-## Environment Variables in Tasks
+mise sets these for each task process:
 
-mise sets these for every task execution:
+| Var | Meaning |
+|-----|---------|
+| `MISE_ORIGINAL_CWD` | Directory where `mise run` was invoked (may differ from config root). |
+| `MISE_CONFIG_ROOT` | Directory containing the resolved `mise.toml`. |
+| `MISE_TASK_NAME` | Name of the executing task. |
+| `MISE_TASK_DIR` | Directory containing the file-task script (file tasks only). |
 
-| Variable | Value |
-|----------|-------|
-| `MISE_ORIGINAL_CWD` | Directory where `mise run` was executed |
-| `MISE_CONFIG_ROOT` | Directory containing `mise.toml` |
-| `MISE_TASK_NAME` | Name of the task being run |
-| `MISE_TASK_DIR` | Directory containing the task script |
+## Templates
 
-## Task Configuration Options
+`run`, `dir`, `env` values, and `description` are Tera-template-expanded with: `{{cwd}}`, `{{config_root}}`, `{{env.VAR}}`, `{{vars.name}}` (from `[vars]`), `{{usage.<arg>}}`. Use `${var:-default}` for shell-level defaults inside `run`.
 
-Complete reference for task properties:
+## Monorepo (Experimental)
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `run` | string/array | Required. Commands to execute |
-| `run_windows` | string | Windows-specific run command |
-| `description` | string | Shown in `mise tasks` output |
-| `alias` | string | Alternative task name |
-| `depends` | array | Tasks to run before this one |
-| `depends_post` | array | Tasks to run after this one completes |
-| `wait_for` | array | Optional dependencies (don't add to run list) |
-| `env` | object | Environment variables for this task only |
-| `tools` | object | Tool versions to activate for task |
-| `dir` | string | Working directory (default: config root) |
-| `sources` | array | Input files for caching/watching |
-| `outputs` | array | Output files for caching |
-| `hide` | bool | Hide from task listings |
-| `quiet` | bool | Don't print command being run |
-| `silent` | bool | Hide all task output |
-| `raw` | bool | Connect directly to stdin/stdout (blocks parallel) |
-| `raw_args` | bool | Pass all args through without parsing |
-| `interactive` | bool | Exclusive I/O lock |
-| `confirm` | string/object | Prompt before running |
+Enable with `MISE_EXPERIMENTAL=1` env plus `experimental_monorepo_root = true` in the root config. Tasks in nested `mise.toml` files are auto-discovered and namespaced by their path relative to root (`packages/api/.mise.toml` `[tasks.build]` → `packages/api:build`). Invocation forms: `//abs/path:task` (absolute from root), `:task` (current config_root), `//...:task` (all projects), `path/*:task` (glob over subdirs).
 
-### Dependency Types
+## Remote Includes
 
-- `depends`: Runs before task; added to execution list
-- `depends_post`: Runs after task; still added to list
-- `wait_for`: Runs before if already running; NOT added to list
+`[task_config] includes = […]` pulls task definitions from remote or local sources. Each entry is a directory; remote form: `git::https://github.com/org/repo.git//tasks?ref=main`. Later entries override earlier ones; a local `.mise/tasks` entry last lets you override shared remote tasks per-project.
 
-```toml
-[tasks.lint]
-run = "eslint ."
+## Pitfalls
 
-[tasks.test]
-depends = ["lint"]        # Runs lint first
-wait_for = ["render"]     # Waits if render is running, doesn't add to list
-run = "npm test"
-```
-
-## CLI Commands
-
-| Command | What it does |
-|---------|--------------|
-| `mise install [tool]` | Downloads and installs tool versions defined in config |
-| `mise use <tool@version>` | Installs tool and updates config file |
-| `mise use -g <tool@version>` | Sets global default (updates ~/.config/mise/config.toml) |
-| `mise exec <tool> -- <cmd>` | Runs command with specific tool version in PATH |
-| `mise run <task>` | Executes task (resolves dependencies, parallel executes) |
-| `mise tasks` | Lists available tasks from all config sources |
-| `mise watch <task>` | Runs task and re-runs when source files change |
-| `mise set KEY=VALUE` | Sets config value in nearest config file |
-| `mise env` | Outputs shell commands to set environment |
-| `mise shell` | Spawns subshell with activated environment |
-| `mise doctor` | Checks mise installation and configuration |
-| `mise config` | Shows loaded config files and their paths |
-| `mise current` | Shows active tool versions for current directory |
-| `mise which <tool>` | Shows full path to tool executable |
-
-## Configuration Hierarchy
-
-Loaded in order (later overrides earlier):
-
-1. `~/.config/mise/config.toml` - Global config
-2. `~/.config/mise/conf.d/*.toml` - Global includes
-3. Parent `.mise.toml` files going up directory tree
-4. `./.mise.toml` or `./mise.toml` - Project config
-5. `./.mise.local.toml` - Local override (not committed)
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| Task not found | `mise tasks` lists available; check file executable bit |
-| Tools not in PATH | Add shell activation; run `mise trust .mise.toml` |
-| Task runs on every call | Ensure `sources` and `outputs` are defined correctly |
-| Parallel tasks conflict | Add `raw = true` or `interactive = true` to task |
-| File watch not triggering | `mise watch -v` to see what's being watched |
-| Template variables empty | Use `${var:-default}` for safe defaults |
-| Task runs from wrong dir | Use `dir = "{{cwd}}"` or `cd "$MISE_ORIGINAL_CWD"` |
-
-## Template Variables
-
-Available in task definitions and configs:
-
-- `{{cwd}}` - Current working directory
-- `{{config_root}}` - Directory with mise.toml
-- `{{env.VAR}}` - Environment variable value
-- `{{vars.name}}` - Variable from `[vars]` section
-- `{{usage.arg_name}}` - Usage argument value
-
-## Remote Task Includes
-
-Share tasks across projects (experimental):
-
-```toml
-[task_config]
-includes = [
-  "git::https://github.com/myorg/shared-tasks.git//tasks?ref=main",
-  ".mise/tasks",  # Local override for any shared tasks
-]
-```
+- `env` on a task does NOT flow into its `depends` — redeclare or hoist into `[env]`.
+- File tasks must be `chmod +x` or they're silently skipped.
+- `sources`/`outputs` globs are relative to config root, not cwd.
+- `raw=true` is required for any task that reads stdin or needs a TTY; without it the task gets an empty/closed stdin and may hang or fail.
+- `depends` tasks run once per `mise run` invocation even if shared across multiple requested tasks; `wait_for` does not trigger a run, only joins one already scheduled.
+- Hidden tasks (`_` prefix or `hide=true`) are still runnable explicitly; `hide` only affects `mise tasks` listing.
